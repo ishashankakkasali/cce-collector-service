@@ -11,7 +11,7 @@ import java.util.Map;
 
 /**
  * CloudEventMessage — the Kafka message published to cce.events.inbound.
- * Uses camelCase field names matching the Compliance Service consumer contract.
+ * Field names use lowercase per the CloudEvents spec — no field name translation is performed.
  */
 @Data
 @Builder
@@ -23,15 +23,15 @@ public class CloudEventMessage {
     private String id;
     private String source;
     private String type;
-    private String specVersion;
+    private String specversion;
     private String subject;
     private OffsetDateTime time;
-    private String dataContentType;
-    private String correlationId;
-    private String sourceEventId;
-    private String protocolInstanceId;
-    private String protocolDefinitionId;
-    private String actionId;
-    private String facilityId;
+    private String datacontenttype;
+    private String correlationid;
+    private String sourceeventid;
+    private String protocolinstanceid;
+    private String protocoldefinitionid;
+    private String actionid;
+    private String facilityid;
     private Map<String, Object> data;
 }

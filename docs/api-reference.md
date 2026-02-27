@@ -124,11 +124,11 @@ Ingest a single CloudEvents-formatted clinical event.
 
 ---
 
-## 2. Dead Letter Management
+## 2. Rejected Event Management
 
-### GET /v1/dead-letters
+### GET /v1/events/rejected
 
-List dead-letter events with pagination.
+List rejected events with pagination. Queries `inbound_event` where `status = 'REJECTED'`.
 
 #### Query Parameters
 
@@ -136,6 +136,8 @@ List dead-letter events with pagination.
 |-----------|------|---------|-------------|
 | `page` | `int` | `0` | Page number (zero-based) |
 | `size` | `int` | `20` | Page size |
+| `rejectionReason` | `string` | — | Filter by rejection reason (e.g., `INVALID_FHIR`) |
+| `resolved` | `boolean` | — | Filter by resolution status |
 
 #### Response
 
@@ -144,16 +146,15 @@ List dead-letter events with pagination.
   "data": {
     "content": [
       {
-        "id": "uuid-deadletter-001",
+        "id": "uuid-inbound-001",
         "cloudEventsId": "evt-bad-001",
         "source": "ebuzima/kigali-south",
         "eventType": "cce.encounter.created",
         "rejectionReason": "INVALID_FHIR",
         "failureStage": "VALIDATION",
-        "errorMessage": "Unable to parse FHIR resource",
-        "retryCount": 0,
+        "errorDetails": "Unable to parse FHIR resource",
         "resolved": false,
-        "createdAt": "2025-01-15T09:30:05Z"
+        "receivedAt": "2025-01-15T09:30:05Z"
       }
     ],
     "totalElements": 1,
@@ -164,17 +165,17 @@ List dead-letter events with pagination.
 }
 ```
 
-### GET /v1/dead-letters/{id}
+### GET /v1/events/rejected/{id}
 
-Retrieve a single dead-letter event by ID.
+Retrieve a single rejected event by `inbound_event` ID.
 
 #### Response
 
 Same structure as individual item in the list response.
 
-### POST /v1/dead-letters/{id}/retry
+### POST /v1/events/rejected/{id}/retry
 
-Retry processing a dead-letter event.
+Retry processing a rejected event. Re-runs the validation pipeline on the original `raw_payload`.
 
 #### Response
 
@@ -183,12 +184,14 @@ Retry processing a dead-letter event.
 ```json
 {
   "data": {
-    "id": "uuid-deadletter-001",
-    "status": "retrying",
-    "retryCount": 1
+    "id": "uuid-inbound-001",
+    "status": "ACCEPTED",
+    "message": "Event reprocessed successfully"
   }
 }
 ```
+
+**422 Unprocessable Entity** — if revalidation still fails, returns updated error details.
 
 ---
 
@@ -235,7 +238,7 @@ Standard Spring Boot Actuator endpoints:
 | `VALIDATION_ERROR` | 400 | CloudEvents envelope validation failed |
 | `FHIR_VALIDATION_ERROR` | 422 | FHIR payload failed structural validation |
 | `DUPLICATE_EVENT` | 200 | Event already received (idempotent) |
-| `KAFKA_PUBLISH_ERROR` | 500 | Failed to publish to Kafka (event persisted, retry pending) |
+| `KAFKA_PUBLISH_ERROR` | 500 | Failed to publish to Kafka — source system should retry |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
 | `NOT_FOUND` | 404 | Resource not found |
 | `CONSTRAINT_VIOLATION` | 400 | Request body validation error (Bean Validation) |
@@ -244,18 +247,9 @@ Standard Spring Boot Actuator endpoints:
 
 ## 5. CloudEvents Field Name Conventions
 
-The service performs field name translation between the HTTP inbound format and the Kafka outbound format:
+The Collector preserves **CloudEvents spec field names (lowercase)** end-to-end — from HTTP inbound through to the Kafka message. No field name translation is performed.
 
-| Inbound (HTTP, lowercase per spec) | Outbound (Kafka, camelCase) |
-|------------------------------------|----------------------------|
-| `specversion` | `specVersion` |
-| `datacontenttype` | `dataContentType` |
-| `facilityid` | `facilityId` |
-| `correlationid` | `correlationId` |
-| `sourceeventid` | `sourceEventId` |
-| `protocolinstanceid` | `protocolInstanceId` |
-| `protocoldefinitionid` | `protocolDefinitionId` |
-| `actionid` | `actionId` |
+Multi-word field names follow the CloudEvents convention of concatenated lowercase (e.g., `specversion`, `datacontenttype`, `correlationid`).
 
 ---
 
@@ -289,6 +283,5 @@ The service performs field name translation between the HTTP inbound format and 
 |-----------|-------|
 | Max event ID length | 256 characters |
 | Dedup lookback window | 30 days (configurable) |
-| Kafka publish retries | 3 |
-| Outbox retry interval | 30 seconds |
-| Max pending retries per cycle | 100 |
+| Kafka publish retries | 3 (producer-level) |
+| Max payload size | 1 MB |

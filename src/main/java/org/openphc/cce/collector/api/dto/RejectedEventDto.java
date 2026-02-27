@@ -11,17 +11,16 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * DTO for dead-letter event responses.
+ * DTO for rejected event responses (from inbound_event table).
  */
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class DeadLetterDto {
+public class RejectedEventDto {
 
     private UUID id;
-    private UUID inboundEventId;
     private String cloudeventsId;
     private String source;
     private String type;
@@ -33,8 +32,6 @@ public class DeadLetterDto {
     private String correlationId;
     private String facilityId;
     private OffsetDateTime receivedAt;
-    private int retryCount;
-    private OffsetDateTime nextRetryAt;
     private boolean resolved;
     private OffsetDateTime resolvedAt;
 }

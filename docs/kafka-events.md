@@ -13,20 +13,22 @@ Detailed reference for all Kafka topics, message schemas, publishing contracts, 
 | **Topic** | `cce.events.inbound` |
 | **Direction** | Produced by Collector, consumed by Compliance Service |
 | **Message Key** | `subject` (patient UPID) — guarantees per-patient ordering |
-| **Message Value** | `CloudEventMessage` JSON (camelCase fields) |
+| **Message Value** | CloudEvents JSON (lowercase field names per spec) |
 | **Serialization** | Key: `StringSerializer`, Value: `JsonSerializer` |
-| **Guarantees** | Exactly-once semantics (idempotent producer + outbox pattern) |
+| **Guarantees** | At-least-once delivery (idempotent producer, synchronous publish) |
 | **Ordering** | Per-patient ordering within a partition (key = patient UPID) |
 
-### 1.2 `cce.deadletter` — Dead Letter Topic
+### 1.2 `cce.deadletter` — Rejected Event Monitoring Topic (Optional)
 
 | Property | Value |
 |----------|-------|
 | **Topic** | `cce.deadletter` |
 | **Direction** | Produced by Collector (optional, for Kafka-based monitoring) |
 | **Message Key** | `subject` (patient UPID, if available) |
-| **Message Value** | Dead letter event JSON |
+| **Message Value** | Rejected event summary JSON |
 | **Purpose** | Downstream alerting/monitoring of rejected events |
+
+> **Note:** The primary rejection record is stored in `inbound_event` (with `status = REJECTED`, `rejection_reason`, `failure_stage`, and `error_details`). Publishing to `cce.deadletter` is optional and intended for external monitoring systems that consume Kafka rather than query the database.
 
 ---
 
@@ -59,25 +61,25 @@ spring:
 
 ---
 
-## 3. CloudEventMessage Schema
+## 3. Kafka Message Schema
 
-The Kafka message value is a `CloudEventMessage` JSON object. Field names are **camelCase** (translated from CloudEvents lowercase during normalization).
+The Kafka message value is a CloudEvents JSON object. Field names use **lowercase** per the CloudEvents spec — no field name translation is performed by the Collector.
 
 ```json
 {
   "id": "evt-eb010001-0001-4000-8000-000000000001",
   "source": "rhie-mediator",
   "type": "org.openphc.cce.encounter",
-  "specVersion": "1.0",
+  "specversion": "1.0",
   "subject": "260225-0002-5501",
   "time": "2026-02-25T08:00:00Z",
-  "dataContentType": "application/fhir+json",
-  "correlationId": "corr-1343872c-636d-506f-b041-1e571d426932",
-  "sourceEventId": "enc-visit-20260225-0001",
-  "protocolInstanceId": null,
-  "protocolDefinitionId": null,
-  "actionId": null,
-  "facilityId": "0002",
+  "datacontenttype": "application/fhir+json",
+  "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
+  "sourceeventid": "enc-visit-20260225-0001",
+  "protocolinstanceid": null,
+  "protocoldefinitionid": null,
+  "actionid": null,
+  "facilityid": "0002",
   "data": {
     "resourceType": "Encounter",
     "id": "enc-uuid-visit-kicukiro-001",
@@ -93,55 +95,39 @@ The Kafka message value is a `CloudEventMessage` JSON object. Field names are **
 |-------|------|----------|-------------|
 | `id` | `String` | Yes | CloudEvents event identifier (from source) |
 | `source` | `String` | Yes | Event source (e.g., `rhie-mediator`, `ebuzima/kigali-south`) |
-| `type` | `String` | Yes | Normalized event type (`org.openphc.cce.<resource>`) |
-| `specVersion` | `String` | Yes | Always `"1.0"` |
+| `type` | `String` | Yes | Validated event type (`org.openphc.cce.<resource>`) — emitter adaptor is responsible for normalization |
+| `specversion` | `String` | Yes | Always `"1.0"` |
 | `subject` | `String` | Yes | Patient UPID — also the Kafka message key |
 | `time` | `ISO-8601 datetime` | Yes | Event time (source-provided or server-generated) |
-| `dataContentType` | `String` | Yes | MIME type (typically `application/fhir+json`) |
-| `correlationId` | `String` | Yes | Distributed tracing ID (source-provided or generated `corr-<uuid>`) |
-| `sourceEventId` | `String` | No | Source system's internal event ID |
-| `protocolInstanceId` | `String` | No | Protocol instance UUID (usually null — Compliance Service resolves) |
-| `protocolDefinitionId` | `String` | No | Protocol definition UUID (usually null — Compliance Service resolves) |
-| `actionId` | `String` | No | Action/step ID (usually null — Compliance Service resolves) |
-| `facilityId` | `String` | No | Healthcare facility FOSA ID |
-| `data` | `Object` | Yes | FHIR R4 resource JSON (structurally validated) |
+| `datacontenttype` | `String` | Yes | MIME type (typically `application/fhir+json`) |
+| `correlationid` | `String` | Yes | Distributed tracing ID (source-provided or generated `corr-<uuid>`) |
+| `sourceeventid` | `String` | No | Source system's internal event ID |
+| `protocolinstanceid` | `String` | No | Protocol instance UUID (usually null — Compliance Service resolves) |
+| `protocoldefinitionid` | `String` | No | Protocol definition UUID (usually null — Compliance Service resolves) |
+| `actionid` | `String` | No | Action/step ID (usually null — Compliance Service resolves) |
+| `facilityid` | `String` | No | Healthcare facility FOSA ID |
+| `data` | `Object` | Yes | FHIR R4 resource JSON or valid JSON object (structurally validated) |
 
 > **Note:** `null` fields are omitted from the JSON output (`@JsonInclude(NON_NULL)`).
 
 ---
 
-## 4. Outbox Pattern
+## 4. Synchronous Publish
 
-The Collector uses the **transactional outbox pattern** to guarantee at-least-once Kafka delivery:
+The Collector publishes to Kafka **synchronously** during request processing. There is no outbox pattern or background retry.
 
 ```
-HTTP Request → PostgreSQL (event_log, publish_status=PENDING) → Kafka Publish → Update (publish_status=PUBLISHED)
+HTTP Request → Validate → Persist (inbound_event, status=ACCEPTED) → Kafka Publish → 202 Accepted
+                                                                     → Failure → Update (status=REJECTED, reason=KAFKA_PUBLISH_FAILURE) → 500 Internal Server Error
 ```
 
 ### How It Works
 
-1. Normalized event is persisted to `event_log` with `publish_status = 'PENDING'`
-2. `EventPublisher.publish()` sends the message to Kafka
-3. On success: `publish_status` → `PUBLISHED`, Kafka metadata recorded (`kafka_topic`, `kafka_partition`, `kafka_offset`, `published_at`)
-4. On failure: `publish_status` → `FAILED`, dead letter created
-5. A scheduled retry (`@Scheduled`) scans for `PENDING`/`FAILED` records and retries
-
-### Retry Configuration
-
-| Property | Default | Description |
-|----------|---------|-------------|
-| `cce.collector.outbox.retry-interval-seconds` | `30` | How often to scan for unpublished records |
-| `cce.collector.outbox.retry-max-age-minutes` | `60` | Stop retrying records older than this |
-
-### Retry Query
-
-```sql
--- Records eligible for retry
-SELECT * FROM event_log
-WHERE publish_status IN ('PENDING', 'FAILED')
-  AND received_at < now() - interval '30 seconds'   -- skip very recent (in-flight)
-  AND received_at > now() - interval '60 minutes';   -- skip too old (max age)
-```
+1. Validated event is persisted to `inbound_event` with `status = 'ACCEPTED'`
+2. `KafkaTemplate.send()` publishes the message to Kafka synchronously
+3. On success: HTTP 202 returned to caller
+4. On failure: `inbound_event` updated to `status = 'REJECTED'`, `rejection_reason = 'KAFKA_PUBLISH_FAILURE'` — HTTP 500 returned to caller
+5. **No background retry** — the source system is expected to retry the request
 
 ---
 
@@ -176,16 +162,16 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
 |---|-----------|-------------|
 | 1 | `subject` always present | Used for patient protocol instance lookup |
 | 2 | `type` follows `org.openphc.cce.<resource>` | Used for Tier 1 structural matching in `trigger_index` |
-| 3 | `data` contains valid FHIR R4 resource | Parseable via HAPI FHIR `fhirContext.newJsonParser()` |
-| 4 | Field names are camelCase | Matching the `CloudEventMessage` Java class |
+| 3 | `data` contains valid payload | FHIR R4 resource or valid JSON object depending on `datacontenttype` |
+| 4 | Field names use CloudEvents lowercase convention | e.g., `specversion`, `datacontenttype`, `correlationid` |
 | 5 | Kafka key = `subject` | Per-patient ordering |
-| 6 | `correlationId` always present | For distributed tracing |
-| 7 | Each message maps to an `event_log` row | Authoritative source of truth |
+| 6 | `correlationid` always present | For distributed tracing |
+| 7 | Each message maps to an `inbound_event` row | Authoritative source of truth |
 
 **What the Collector does NOT populate:**
-- `protocolInstanceId` — Compliance Service resolves this from its `protocol_instance` table
-- `protocolDefinitionId` — Compliance Service resolves this from its `protocol_definition` table
-- `actionId` — Compliance Service determines the matching action/step
+- `protocolinstanceid` — Compliance Service resolves this from its `protocol_instance` table
+- `protocoldefinitionid` — Compliance Service resolves this from its `protocol_definition` table
+- `actionid` — Compliance Service determines the matching action/step
 
 ---
 
@@ -201,13 +187,13 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "id": "evt-eb010001-0001-4000-8000-000000000001",
   "source": "rhie-mediator",
   "type": "org.openphc.cce.encounter",
-  "specVersion": "1.0",
+  "specversion": "1.0",
   "subject": "260225-0002-5501",
   "time": "2026-02-25T08:00:00Z",
-  "dataContentType": "application/fhir+json",
-  "correlationId": "corr-1343872c-636d-506f-b041-1e571d426932",
-  "sourceEventId": "enc-visit-20260225-0001",
-  "facilityId": "0002",
+  "datacontenttype": "application/fhir+json",
+  "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
+  "sourceeventid": "enc-visit-20260225-0001",
+  "facilityid": "0002",
   "data": {
     "resourceType": "Encounter",
     "id": "enc-uuid-visit-kicukiro-001",
@@ -249,13 +235,13 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "id": "evt-eb010001-0002-4000-8000-000000000002",
   "source": "rhie-mediator",
   "type": "org.openphc.cce.observation",
-  "specVersion": "1.0",
+  "specversion": "1.0",
   "subject": "260225-0002-5501",
   "time": "2026-02-25T08:05:00Z",
-  "dataContentType": "application/fhir+json",
-  "correlationId": "corr-1343872c-636d-506f-b041-1e571d426932",
-  "sourceEventId": "obs-bp-20260225-0001",
-  "facilityId": "0002",
+  "datacontenttype": "application/fhir+json",
+  "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
+  "sourceeventid": "obs-bp-20260225-0001",
+  "facilityid": "0002",
   "data": {
     "resourceType": "Observation",
     "id": "obs-uuid-bp-001",
@@ -312,13 +298,13 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "id": "evt-eb010001-0006-4000-8000-000000000006",
   "source": "rhie-mediator",
   "type": "org.openphc.cce.condition",
-  "specVersion": "1.0",
+  "specversion": "1.0",
   "subject": "260225-0002-5501",
   "time": "2026-02-25T08:25:00Z",
-  "dataContentType": "application/fhir+json",
-  "correlationId": "corr-1343872c-636d-506f-b041-1e571d426932",
-  "sourceEventId": "cond-diag-20260225-0001",
-  "facilityId": "0002",
+  "datacontenttype": "application/fhir+json",
+  "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
+  "sourceeventid": "cond-diag-20260225-0001",
+  "facilityid": "0002",
   "data": {
     "resourceType": "Condition",
     "id": "cond-uuid-malaria-001",
@@ -355,13 +341,13 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "id": "evt-eb010001-0007-4000-8000-000000000007",
   "source": "rhie-mediator",
   "type": "org.openphc.cce.medicationrequest",
-  "specVersion": "1.0",
+  "specversion": "1.0",
   "subject": "260225-0002-5501",
   "time": "2026-02-25T08:30:00Z",
-  "dataContentType": "application/fhir+json",
-  "correlationId": "corr-1343872c-636d-506f-b041-1e571d426932",
-  "sourceEventId": "rx-act-20260225-0001",
-  "facilityId": "0002",
+  "datacontenttype": "application/fhir+json",
+  "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
+  "sourceeventid": "rx-act-20260225-0001",
+  "facilityid": "0002",
   "data": {
     "resourceType": "MedicationRequest",
     "id": "rx-uuid-act-001",

@@ -34,7 +34,6 @@ cce:
   kafka:
     topics:
       inbound: cce.events.inbound
-      dead-letter: cce.deadletter
   collector:
     max-payload-size: 1048576
     fhir-validation:
@@ -42,9 +41,6 @@ cce:
       strict-mode: false
     dedup:
       lookback-days: 30
-    outbox:
-      retry-interval-seconds: 30
-      retry-max-age-minutes: 60
 
 server:
   port: 8080

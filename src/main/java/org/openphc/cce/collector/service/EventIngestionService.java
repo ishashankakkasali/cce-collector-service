@@ -7,37 +7,38 @@ import lombok.extern.slf4j.Slf4j;
 import org.openphc.cce.collector.api.dto.*;
 import org.openphc.cce.collector.api.exception.CloudEventValidationException;
 import org.openphc.cce.collector.api.exception.FhirValidationException;
-import org.openphc.cce.collector.domain.model.EventLog;
+import org.openphc.cce.collector.api.exception.InvalidEventTypeException;
+import org.openphc.cce.collector.api.exception.KafkaPublishException;
+import org.openphc.cce.collector.api.exception.UnsupportedContentTypeException;
 import org.openphc.cce.collector.domain.model.InboundEvent;
+import org.openphc.cce.collector.domain.model.enums.FailureStage;
 import org.openphc.cce.collector.domain.model.enums.InboundStatus;
-import org.openphc.cce.collector.domain.model.enums.PublishStatus;
 import org.openphc.cce.collector.domain.model.enums.RejectionReason;
-import org.openphc.cce.collector.domain.repository.EventLogRepository;
 import org.openphc.cce.collector.domain.repository.InboundEventRepository;
+import org.openphc.cce.collector.kafka.InboundEventProducer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.util.*;
 
 /**
- * Main orchestrator: validate → normalize → persist → deduplicate → publish.
- * Implements the full event ingestion flow as specified in the design.
+ * Main orchestrator: validate → deduplicate → persist → validate type → enrich → validate payload → publish.
+ * Implements the single-table, synchronous-publish event ingestion flow.
  */
 @Service
 @Slf4j
 public class EventIngestionService {
 
     private final CloudEventValidator cloudEventValidator;
+    private final EventTypeValidator eventTypeValidator;
+    private final EventDefaultsEnricher eventDefaultsEnricher;
     private final FhirPayloadValidator fhirPayloadValidator;
-    private final EventNormalizer eventNormalizer;
     private final DeduplicationService deduplicationService;
-    private final EventPublisher eventPublisher;
-    private final DeadLetterService deadLetterService;
+    private final RejectionService rejectionService;
+    private final InboundEventProducer inboundEventProducer;
     private final InboundEventRepository inboundEventRepository;
-    private final EventLogRepository eventLogRepository;
     private final String inboundTopic;
 
     // Metrics
@@ -46,23 +47,23 @@ public class EventIngestionService {
 
     public EventIngestionService(
             CloudEventValidator cloudEventValidator,
+            EventTypeValidator eventTypeValidator,
+            EventDefaultsEnricher eventDefaultsEnricher,
             FhirPayloadValidator fhirPayloadValidator,
-            EventNormalizer eventNormalizer,
             DeduplicationService deduplicationService,
-            EventPublisher eventPublisher,
-            DeadLetterService deadLetterService,
+            RejectionService rejectionService,
+            InboundEventProducer inboundEventProducer,
             InboundEventRepository inboundEventRepository,
-            EventLogRepository eventLogRepository,
             @Value("${cce.kafka.topics.inbound}") String inboundTopic,
             MeterRegistry meterRegistry) {
         this.cloudEventValidator = cloudEventValidator;
+        this.eventTypeValidator = eventTypeValidator;
+        this.eventDefaultsEnricher = eventDefaultsEnricher;
         this.fhirPayloadValidator = fhirPayloadValidator;
-        this.eventNormalizer = eventNormalizer;
         this.deduplicationService = deduplicationService;
-        this.eventPublisher = eventPublisher;
-        this.deadLetterService = deadLetterService;
+        this.rejectionService = rejectionService;
+        this.inboundEventProducer = inboundEventProducer;
         this.inboundEventRepository = inboundEventRepository;
-        this.eventLogRepository = eventLogRepository;
         this.inboundTopic = inboundTopic;
         this.meterRegistry = meterRegistry;
         this.ingestionTimer = Timer.builder("cce.collector.ingestion.duration")
@@ -78,7 +79,9 @@ public class EventIngestionService {
     }
 
     /**
-     * Core ingestion logic for a single event.
+     * Core ingestion logic implementing the 9-step flow:
+     * 1. Receive → 2. Validate envelope → 3. Dedup → 4. Persist → 5. Validate type →
+     * 6. Enrich defaults → 7. Validate payload → 8. Accept → 9. Kafka publish
      */
     private EventIngestionResponse doIngest(EventIngestionRequest request) {
         OffsetDateTime receivedAt = OffsetDateTime.now(ZoneOffset.UTC);
@@ -88,11 +91,6 @@ public class EventIngestionService {
             cloudEventValidator.validate(request);
         } catch (CloudEventValidationException e) {
             recordMetric(request.getSource(), "rejected");
-            deadLetterService.persistValidationFailure(
-                    null, request.getId(), request.getSource(), request.getType(),
-                    request.getSubject(), request.toRawPayload(),
-                    RejectionReason.INVALID_ENVELOPE, e.getMessage(),
-                    request.getCorrelationid(), request.getFacilityid());
             throw e;
         }
 
@@ -102,53 +100,62 @@ public class EventIngestionService {
             return buildDuplicateResponse(request, receivedAt);
         }
 
-        // Step 4: Persist raw inbound event
+        // Step 4: Persist raw inbound event (status = RECEIVED, first write — audit trail)
         InboundEvent inboundEvent = persistInboundEvent(request, receivedAt);
 
-        // Step 5: Normalization
-        String normalizedType = eventNormalizer.normalizeEventType(request.getType());
-        String correlationId = eventNormalizer.ensureCorrelationId(request.getCorrelationid());
-        OffsetDateTime eventTime = eventNormalizer.ensureEventTime(request.getTime());
-
-        // Step 6: FHIR payload validation
-        try {
-            fhirPayloadValidator.validate(request);
-        } catch (FhirValidationException e) {
-            inboundEvent.setStatus(InboundStatus.REJECTED);
-            inboundEvent.setRejectionReason(RejectionReason.INVALID_FHIR.name());
-            inboundEventRepository.save(inboundEvent);
+        // Step 5: Event type validation (strict — no normalization)
+        if (!eventTypeValidator.isValid(request.getType())) {
+            rejectionService.reject(inboundEvent, RejectionReason.INVALID_EVENT_TYPE,
+                    FailureStage.VALIDATION,
+                    "Event type '" + request.getType() + "' does not match required pattern org.openphc.cce.<resource>");
             recordMetric(request.getSource(), "rejected");
-            deadLetterService.persistValidationFailure(
-                    inboundEvent.getId(), request.getId(), request.getSource(), request.getType(),
-                    request.getSubject(), request.toRawPayload(),
-                    RejectionReason.INVALID_FHIR, String.join("; ", e.getErrors()),
-                    correlationId, request.getFacilityid());
-            throw e;
+            throw new InvalidEventTypeException(request.getType());
         }
 
-        // Step 7: Update inbound event status to accepted
+        // Step 6: Default enrichment
+        String correlationId = eventDefaultsEnricher.ensureCorrelationId(request.getCorrelationid());
+        OffsetDateTime eventTime = eventDefaultsEnricher.ensureEventTime(request.getTime());
+        String dataContentType = eventDefaultsEnricher.ensureDataContentType(request.getDatacontenttype());
+
+        // Update enriched fields on the inbound event
+        inboundEvent.setCorrelationId(correlationId);
+        inboundEvent.setEventTime(eventTime);
+        inboundEvent.setDataContentType(dataContentType);
+
+        // Step 7: Payload validation (branched by datacontenttype)
+        FhirPayloadValidator.PayloadValidationResult payloadResult =
+                fhirPayloadValidator.validate(request, dataContentType);
+        if (!payloadResult.isValid()) {
+            rejectionService.reject(inboundEvent, payloadResult.getRejectionReason(),
+                    FailureStage.VALIDATION, String.join("; ", payloadResult.getErrors()));
+            recordMetric(request.getSource(), "rejected");
+
+            // Throw the correct exception based on rejection reason
+            if (payloadResult.getRejectionReason() == RejectionReason.UNSUPPORTED_CONTENT_TYPE) {
+                throw new UnsupportedContentTypeException(
+                        dataContentType, payloadResult.getMessage(), payloadResult.getErrors());
+            }
+            throw new FhirValidationException(payloadResult.getMessage(), payloadResult.getErrors());
+        }
+
+        // Step 8: Update inbound event status to ACCEPTED
         inboundEvent.setStatus(InboundStatus.ACCEPTED);
         inboundEventRepository.save(inboundEvent);
 
-        // Step 8: Persist normalized event to event_log (outbox)
-        EventLog eventLog = persistEventLog(request, inboundEvent, normalizedType,
-                correlationId, eventTime, receivedAt);
-
-        // Step 9: Publish to Kafka
+        // Step 9: Synchronous Kafka publish
+        CloudEventMessage message = buildCloudEventMessage(inboundEvent, request);
         try {
-            eventPublisher.publish(eventLog);
+            inboundEventProducer.publish(message);
         } catch (Exception e) {
             log.error("Kafka publish failed for event id={}: {}", request.getId(), e.getMessage());
-            deadLetterService.persistKafkaFailure(
-                    inboundEvent.getId(), request.getId(), request.getSource(),
-                    normalizedType, request.getSubject(), request.toRawPayload(),
-                    e.getMessage(), correlationId, request.getFacilityid());
-            // Event stays in event_log with publish_status=PENDING/FAILED for retry
+            rejectionService.reject(inboundEvent, RejectionReason.KAFKA_PUBLISH_FAILURE,
+                    FailureStage.KAFKA_PUBLISH, e.getMessage());
+            recordMetric(request.getSource(), "kafka_failure");
+            throw new KafkaPublishException(message, e);
         }
 
         recordMetric(request.getSource(), "accepted");
 
-        // Step 10: Return HTTP response
         return EventIngestionResponse.builder()
                 .eventId(request.getId())
                 .status("accepted")
@@ -184,33 +191,25 @@ public class EventIngestionService {
     }
 
     /**
-     * Persist the normalized event to event_log (outbox table).
+     * Build a CloudEventMessage from inbound event and request data for Kafka publishing.
      */
-    @Transactional
-    protected EventLog persistEventLog(EventIngestionRequest request, InboundEvent inboundEvent,
-                                        String normalizedType, String correlationId,
-                                        OffsetDateTime eventTime, OffsetDateTime receivedAt) {
-        EventLog eventLog = EventLog.builder()
-                .inboundEventId(inboundEvent.getId())
-                .cloudeventsId(request.getId())
-                .source(request.getSource())
-                .sourceEventId(request.getSourceeventid())
-                .subject(request.getSubject())
-                .type(normalizedType)
-                .eventTime(eventTime)
-                .receivedAt(receivedAt)
-                .correlationId(correlationId)
+    private CloudEventMessage buildCloudEventMessage(InboundEvent inboundEvent, EventIngestionRequest request) {
+        return CloudEventMessage.builder()
+                .id(inboundEvent.getCloudeventsId())
+                .source(inboundEvent.getSource())
+                .type(inboundEvent.getType())
+                .specversion("1.0")
+                .subject(inboundEvent.getSubject())
+                .time(inboundEvent.getEventTime())
+                .datacontenttype(inboundEvent.getDataContentType())
+                .correlationid(inboundEvent.getCorrelationId())
+                .sourceeventid(inboundEvent.getSourceEventId())
+                .protocolinstanceid(request.getProtocolinstanceid())
+                .protocoldefinitionid(request.getProtocoldefinitionid())
+                .actionid(request.getActionid())
+                .facilityid(inboundEvent.getFacilityId())
                 .data(request.getData())
-                .dataContentType(request.getDatacontenttype() != null
-                        ? request.getDatacontenttype() : "application/fhir+json")
-                .protocolInstanceId(parseUuid(request.getProtocolinstanceid()))
-                .protocolDefinitionId(parseUuid(request.getProtocoldefinitionid()))
-                .actionId(request.getActionid())
-                .facilityId(request.getFacilityid())
-                .publishStatus(PublishStatus.PENDING)
                 .build();
-
-        return eventLogRepository.save(eventLog);
     }
 
     private EventIngestionResponse buildDuplicateResponse(EventIngestionRequest request, OffsetDateTime receivedAt) {
@@ -220,18 +219,6 @@ public class EventIngestionService {
                 .correlationId(request.getCorrelationid())
                 .receivedAt(receivedAt)
                 .build();
-    }
-
-    private UUID parseUuid(String value) {
-        if (value == null || value.isBlank()) {
-            return null;
-        }
-        try {
-            return UUID.fromString(value);
-        } catch (IllegalArgumentException e) {
-            log.warn("Invalid UUID format: {}", value);
-            return null;
-        }
     }
 
     private void recordMetric(String source, String status) {

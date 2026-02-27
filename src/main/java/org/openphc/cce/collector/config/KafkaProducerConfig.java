@@ -46,10 +46,4 @@ public class KafkaProducerConfig {
             @Value("${cce.kafka.topics.inbound}") String topicName) {
         return new NewTopic(topicName, 12, (short) 1); // 12 partitions, replication=1 for dev
     }
-
-    @Bean
-    public NewTopic deadLetterTopic(
-            @Value("${cce.kafka.topics.dead-letter}") String topicName) {
-        return new NewTopic(topicName, 3, (short) 1);
-    }
 }

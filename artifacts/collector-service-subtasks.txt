@@ -1,0 +1,914 @@
+================================================================================
+  CCE COLLECTOR SERVICE — DEVELOPMENT SUB-TASKS (Sequential)
+================================================================================
+
+Service:        cce-collector-service
+Branch:         feature/collector-service
+Port:           8080
+Tech Stack:     Java 21, Spring Boot 3.4.x, PostgreSQL 16+, Kafka 3.7+ (KRaft),
+                HAPI FHIR 7.4.0, Flyway, Micrometer, Testcontainers
+Reference Docs: docs/ (7 files)
+
+Each sub-task below should be completed as a separate commit/PR-ready
+increment. Tasks are ordered by dependency — each builds on the prior.
+
+================================================================================
+ARCHITECTURE SUMMARY (must be understood before reading sub-tasks)
+================================================================================
+
+  - SINGLE TABLE design: `inbound_event` only (no event_log, no dead_letter_event)
+  - NO outbox pattern: Kafka publish is synchronous within the HTTP request
+  - NO event type normalization: Collector strictly validates type matches
+    `org.openphc.cce.<resource>` — normalization is the emitter adaptor's
+    responsibility (openHIM mediator layer)
+  - NO field name mapping: CloudEvents lowercase field names are preserved
+    end-to-end (HTTP → DB → Kafka) — no camelCase translation
+  - Rejection tracking: directly on `inbound_event` via status, rejection_reason,
+    failure_stage, error_details, resolved, resolved_at columns
+  - Content type branching: `application/fhir+json` (FHIR R4 validation),
+    `application/json` (JSON validity check), other → reject
+  - Kafka failure: returns HTTP 500, source system retries (no background retry)
+  - Single Flyway migration: V1__create_inbound_event.sql
+
+================================================================================
+SUB-TASK C0: Service Design Documents — PR for Customer Review
+================================================================================
+
+DESCRIPTION:
+  Deliver the complete Collector Service design documentation as a PR for
+  customer review and approval BEFORE implementation begins. These documents
+  define the architecture, API contracts, data models, and operational
+  characteristics that the customer must sign off on.
+
+DELIVERABLES:
+  Submit the following 7 documents from docs/ as a single PR:
+
+  1. architecture.md
+     - Service purpose, 9 responsibilities, system context diagram
+     - Tech stack, package structure (single-table design)
+     - Core processing algorithm (9-step ingestion flow)
+     - Database schema overview (inbound_event only), deduplication strategy
+     - Synchronous Kafka publish (no outbox), content type handling
+     - FHIR handling strategy, Compliance Service contract
+
+  2. api-reference.md
+     - POST /v1/events — full request/response spec with examples
+     - Rejected event management endpoints (GET list, GET by ID, POST retry)
+     - Health & actuator endpoints
+     - Response envelopes (ApiResponse, ApiError)
+     - Error codes and HTTP status mapping
+     - CloudEvents field name conventions (lowercase end-to-end), validation rules
+     - Rate limits and constraints
+
+  3. data-dictionary.md
+     - inbound_event table (21 columns, constraints, indexes, rejection tracking)
+     - Enum values (InboundStatus, RejectionReason, FailureStage)
+     - CloudEvents fields (required, recommended, optional extensions)
+     - Kafka message fields (source: inbound_event columns)
+     - Field name reference (HTTP lowercase ↔ DB snake_case)
+     - Event type validation rules (strict — not normalization)
+     - FHIR resource types, Flyway migration reference (V1 only)
+
+  4. kafka-events.md
+     - Topics produced (cce.events.inbound, optional cce.deadletter)
+     - Kafka message schema with all fields (lowercase per CloudEvents spec)
+     - Producer configuration (acks, retries, idempotence)
+     - Synchronous publish lifecycle (no outbox pattern)
+     - Partitioning & ordering strategy
+     - Compliance Service consumer contract
+     - Sample Kafka messages (Encounter, Observation, Condition, MedicationRequest)
+
+  5. flow-diagrams.md
+     - Event ingestion flowchart (main pipeline with 202/500 branching)
+     - Sequence diagram — successful event ingestion (synchronous Kafka publish)
+     - Sequence diagram — validation failure (FHIR)
+     - Sequence diagram — duplicate detection
+     - System context data flow diagram
+     - Database entity diagram (single table)
+     - Field transformation pipeline
+
+  6. deployment-guide.md
+     - Prerequisites, local development setup
+     - Configuration profiles, environment variables
+     - Docker build, Flyway migrations (V1 only, no partitions)
+     - Kubernetes deployment (health probes, secrets, service)
+     - Kafka topic setup, production checklist
+
+  7. operations-runbook.md
+     - Health checks, monitoring metrics & alerting rules
+     - Grafana dashboard panels
+     - Rejected event management (queries, retry, batch resolution)
+     - Database maintenance (table size monitoring, archival)
+     - Troubleshooting (Kafka failures return 500, FHIR validation, duplicates)
+     - Log analysis, emergency procedures (Kafka outage → 500, DB outage → 503)
+
+PR REVIEW CHECKLIST:
+  - [ ] Architecture aligns with CCE Solution Design v0.3
+  - [ ] Single-table design reviewed (inbound_event only, rejection tracking)
+  - [ ] API contracts complete (request/response examples, error codes)
+  - [ ] Database schema reviewed (columns, indexes, constraints)
+  - [ ] Kafka event contracts reviewed (topics, message schema, keys)
+  - [ ] Lowercase field names end-to-end confirmed (no camelCase mapping)
+  - [ ] Event type validation (not normalization) approach approved
+  - [ ] Content type handling reviewed (FHIR + JSON + reject paths)
+  - [ ] Synchronous Kafka publish approved (no outbox, 500 on failure)
+  - [ ] Deduplication strategy approved (lookback window, idempotency)
+  - [ ] Operational procedures reviewed
+
+ACCEPTANCE CRITERIA:
+  - PR raised with all 7 documents
+  - Customer reviews and approves the design
+  - Any feedback incorporated as document updates
+  - PR merged before implementation sub-tasks begin
+
+================================================================================
+SUB-TASK C1: Project Scaffolding & Build Configuration
+================================================================================
+
+DESCRIPTION:
+  Initialize the Spring Boot project with Maven, configure all dependencies,
+  create the base package structure, and add application configuration files.
+
+DELIVERABLES:
+  1. Maven pom.xml with:
+     - parent: spring-boot-starter-parent 3.4.x
+     - java.version: 21
+     - Dependencies:
+       • spring-boot-starter-web
+       • spring-boot-starter-data-jpa
+       • spring-boot-starter-actuator
+       • spring-boot-starter-validation
+       • spring-kafka
+       • postgresql (runtime)
+       • flyway-core + flyway-database-postgresql
+       • ca.uhn.hapi.fhir:hapi-fhir-structures-r4:7.4.0
+       • ca.uhn.hapi.fhir:hapi-fhir-validation:7.4.0
+       • ca.uhn.hapi.fhir:hapi-fhir-validation-resources-r4:7.4.0
+       • micrometer-registry-prometheus
+       • jackson-datatype-jsr310
+       • lombok (optional, compile-only)
+       • spring-boot-starter-test (test)
+       • spring-kafka-test (test)
+       • org.testcontainers:postgresql (test)
+       • org.testcontainers:kafka (test)
+       • org.testcontainers:junit-jupiter (test)
+  2. Package structure under org.openphc.cce.collector:
+     - config/
+     - domain/model/
+     - domain/model/enums/
+     - domain/repository/
+     - service/
+     - kafka/
+     - api/controller/
+     - api/dto/
+     - api/exception/
+     - fhir/
+  3. application.yml with profiles (default, docker):
+     - server.port: 8080
+     - spring.datasource (PostgreSQL HikariCP)
+     - spring.jpa (Hibernate ddl-auto: validate, show-sql: false)
+     - spring.flyway (enabled: true, locations: classpath:db/migration)
+     - spring.kafka (bootstrap-servers, producer config: acks=all, retries=3,
+       enable.idempotence=true, linger.ms=5)
+     - cce.collector.dedup-lookback-days: 30
+     - cce.collector.max-payload-size: 1048576
+     - cce.collector.kafka.topics.inbound: cce.events.inbound
+     - cce.collector.kafka.topics.dead-letter: cce.deadletter
+     - management.endpoints.web.exposure.include: health,info,prometheus,metrics
+     - management.endpoint.health.probes.enabled: true
+     NOTE: No outbox retry/batch-size config — Kafka publish is synchronous
+  4. CollectorServiceApplication.java — @SpringBootApplication entry point
+  5. Dockerfile (multi-stage: Maven build → Eclipse Temurin 21 JRE)
+  6. docker-compose.yml (Collector + PostgreSQL 16 + Kafka/KRaft)
+  7. .gitignore, README.md
+
+ACCEPTANCE CRITERIA:
+  - Application boots successfully with `mvn spring-boot:run`
+  - Actuator health endpoint returns UP at GET /actuator/health
+  - Docker Compose stack starts all 3 containers
+  - All tests pass (mvn verify)
+
+================================================================================
+SUB-TASK C2: Database Schema — Flyway Migration
+================================================================================
+
+DESCRIPTION:
+  Create the single Flyway migration script for the `inbound_event` table.
+  This is the ONLY table owned by the Collector Service — it serves as audit
+  log, deduplication source, rejection tracker, and data source for Kafka
+  messages. No event_log or dead_letter_event tables.
+
+DELIVERABLES:
+  1. V1__create_inbound_event.sql
+     - Table: inbound_event
+     - Columns (21):
+       id (UUID PK, gen_random_uuid()),
+       cloudevents_id (VARCHAR NOT NULL),
+       source (VARCHAR NOT NULL),
+       type (VARCHAR NOT NULL),
+       spec_version (VARCHAR NOT NULL DEFAULT '1.0'),
+       subject (VARCHAR — patient UPID),
+       event_time (TIMESTAMPTZ),
+       data_content_type (VARCHAR DEFAULT 'application/fhir+json'),
+       facility_id (VARCHAR),
+       correlation_id (VARCHAR),
+       source_event_id (VARCHAR),
+       raw_payload (JSONB NOT NULL — immutable original request body),
+       status (VARCHAR NOT NULL DEFAULT 'RECEIVED'),
+       rejection_reason (VARCHAR — reason code if REJECTED),
+       failure_stage (VARCHAR — VALIDATION, PROCESSING, or KAFKA_PUBLISH),
+       error_details (TEXT — stack trace or validation errors),
+       resolved (BOOLEAN NOT NULL DEFAULT false),
+       resolved_at (TIMESTAMPTZ),
+       received_at (TIMESTAMPTZ NOT NULL DEFAULT now())
+     - Unique constraint: (cloudevents_id, source)
+     - Indexes:
+       idx_inbound_event_subject (subject)
+       idx_inbound_event_source (source)
+       idx_inbound_event_status (status)
+       idx_inbound_event_received (received_at)
+       idx_inbound_event_rejection (rejection_reason)
+       idx_inbound_event_unresolved (status, resolved)
+         WHERE status = 'REJECTED' AND resolved = false
+
+ACCEPTANCE CRITERIA:
+  - Flyway migration runs cleanly on fresh PostgreSQL database
+  - All constraints, indexes verified via \dt, \d+, \di
+  - Migration is idempotent on re-run (Flyway checksum stable)
+  - JPA entity passes basic repository save/find test
+
+================================================================================
+SUB-TASK C3: JPA Entity, Enums & Repository
+================================================================================
+
+DESCRIPTION:
+  Create the single JPA entity class for `inbound_event`, enum types for
+  status fields, and Spring Data JPA repository with custom queries.
+
+DELIVERABLES:
+  1. Enums (domain/model/enums/):
+     - InboundStatus: RECEIVED, ACCEPTED, REJECTED, DUPLICATE
+     - RejectionReason: INVALID_ENVELOPE, INVALID_EVENT_TYPE, INVALID_FHIR,
+       INVALID_JSON, UNSUPPORTED_CONTENT_TYPE, DUPLICATE, MISSING_SUBJECT,
+       PAYLOAD_TOO_LARGE, DESERIALIZATION_ERROR, KAFKA_PUBLISH_FAILURE
+     - FailureStage: VALIDATION, PROCESSING, KAFKA_PUBLISH
+
+  2. Entity (domain/model/):
+     - InboundEvent.java
+       • @Entity, @Table(name = "inbound_event")
+       • UUID id (gen_random_uuid()), all 21 columns mapped
+       • @Column(columnDefinition = "jsonb") for raw_payload
+       • @Enumerated(STRING) for status, rejection_reason, failure_stage
+       • @CreationTimestamp for received_at
+       • Rejection tracking: rejection_reason, failure_stage, error_details,
+         resolved (default false), resolved_at
+
+  3. Repository (domain/repository/):
+     - InboundEventRepository.java
+       • findByCloudeventsIdAndSource(String id, String source)
+       • existsByCloudeventsIdAndSourceAndReceivedAtAfter(
+           String id, String source, OffsetDateTime lookbackDate)
+       • findByStatusAndResolvedFalseOrderByReceivedAtDesc(
+           String status, Pageable pageable)
+       • countByStatusAndResolved(String status, boolean resolved)
+
+  4. Unit tests verifying entity serialization and repository queries
+
+ACCEPTANCE CRITERIA:
+  - Entity matches DDL from C2 exactly (Hibernate schema validation passes)
+  - Repository queries return expected data in integration tests
+  - JSONB field (raw_payload) serializes/deserializes correctly with Jackson
+  - All 3 enums cover every value referenced in docs/data-dictionary.md
+
+================================================================================
+SUB-TASK C4: DTO Layer & Response Envelopes
+================================================================================
+
+DESCRIPTION:
+  Create the Data Transfer Objects for REST API request/response and the
+  Kafka message model. Implement the standard response envelope pattern.
+
+DELIVERABLES:
+  1. Request/Response DTOs (api/dto/):
+     - EventIngestionRequest.java
+       • CloudEvents fields: specversion, id, source, type, subject, time,
+         datacontenttype, data (Map<String,Object>), facilityid, correlationid,
+         sourceeventid, protocolinstanceid, protocoldefinitionid, actionid
+       • All field names LOWERCASE (CloudEvents spec — no camelCase)
+       • Bean Validation: @NotBlank on id, source, type, subject; @NotNull on data
+       • @JsonAnySetter for capturing unknown extension attributes
+     - EventIngestionResponse.java
+       • eventId (String), status (accepted/duplicate), correlationId, timestamp
+     - ApiResponse<T>.java — { "data": T }
+     - ApiError.java — { "error": { "code": String, "message": String } }
+     - RejectedEventDto.java
+       • id (UUID), cloudEventsId, source, eventType, rejectionReason,
+         failureStage, errorDetails, resolved, receivedAt
+
+  2. Kafka Message DTO (api/dto/):
+     - CloudEventMessage.java
+       • All fields in LOWERCASE (CloudEvents spec — NO camelCase):
+         id, source, type, specversion, subject, time, datacontenttype,
+         correlationid, sourceeventid, protocolinstanceid,
+         protocoldefinitionid, actionid, facilityid, data (Map<String,Object>)
+       • @JsonInclude(NON_NULL) — omit null fields from Kafka JSON
+       • Java record or class with Jackson annotations
+
+ACCEPTANCE CRITERIA:
+  - EventIngestionRequest deserializes from lowercase CloudEvents JSON correctly
+  - CloudEventMessage serializes to lowercase JSON correctly (NOT camelCase)
+  - Bean validation rejects missing required fields with appropriate messages
+  - ApiResponse/ApiError envelopes match the CCE Design standard
+  - RejectedEventDto includes all rejection tracking fields
+
+================================================================================
+SUB-TASK C5: CloudEvents Envelope Validation Service
+================================================================================
+
+DESCRIPTION:
+  Implement CloudEvents envelope validation per the CCE specification,
+  including all required field checks and constraints.
+
+DELIVERABLES:
+  1. CloudEventValidator.java (service/):
+     - validate(EventIngestionRequest request) → throws CloudEventValidationException
+     - Validation rules:
+       a. specversion must be "1.0"
+       b. id: required, non-blank, max 256 characters
+       c. source: required, non-blank
+       d. type: required, non-blank
+       e. subject: required, non-blank (CCE patient UPID requirement)
+       f. data: required, non-null
+     - Returns a list of ALL validation errors (not just first)
+     - Throws CloudEventValidationException with aggregated messages
+
+  2. CloudEventValidationException.java (api/exception/):
+     - Extends RuntimeException
+     - Contains List<String> validationErrors
+
+  3. Unit tests covering:
+     - Valid CloudEvent passes
+     - Each required field missing → specific error
+     - specversion != "1.0" → error
+     - id exceeds 256 chars → error
+     - Multiple missing fields → all reported
+
+ACCEPTANCE CRITERIA:
+  - All 6+ validation rules enforced
+  - Error messages are descriptive and include the field name
+  - 100% branch coverage in unit tests
+
+================================================================================
+SUB-TASK C6: Event Type Validation & Defaults Enrichment
+================================================================================
+
+DESCRIPTION:
+  Implement strict event type validation — the Collector does NOT normalize
+  event types. It validates that the `type` field matches the required
+  `org.openphc.cce.<resource>` pattern and rejects non-conforming events.
+  Event type normalization is the emitter adaptor's (openHIM mediator)
+  responsibility. Also implement server-side defaults enrichment.
+
+DELIVERABLES:
+  1. EventTypeValidator.java (service/):
+     - validate(String type) → throws InvalidEventTypeException
+     - Validation:
+       a. type must match pattern: org.openphc.cce.<resource>
+          where <resource> is lowercase alpha (e.g., encounter, observation)
+       b. Regex: ^org\.openphc\.cce\.[a-z]+$
+     - Valid examples: org.openphc.cce.encounter, org.openphc.cce.observation
+     - Invalid (REJECTED): cce.encounter.created, custom.event.type,
+       org.openphc.cce.Encounter (uppercase)
+
+  2. EventDefaultsEnricher.java (service/):
+     - ensureCorrelationId(String existing) → String
+       • If present and non-blank: return as-is
+       • If absent: generate "corr-" + UUID.randomUUID()
+     - ensureEventTime(String rawTime) → OffsetDateTime
+       • If present and parseable: parse and return
+       • If absent: return OffsetDateTime.now(ZoneOffset.UTC)
+     - ensureDataContentType(String existing) → String
+       • If present and non-blank: return as-is
+       • If absent: return "application/fhir+json"
+
+  3. Unit tests:
+     - Event type validation: all valid/invalid patterns from docs
+     - Correlation ID: present passes through, absent generates corr-<uuid>
+     - Time: present parses correctly, absent fills with server time
+     - DataContentType: present passes through, absent defaults to fhir+json
+
+ACCEPTANCE CRITERIA:
+  - Event types NOT matching org.openphc.cce.<resource> are REJECTED
+  - No normalization logic (no mapping from cce.encounter.created → anything)
+  - Defaults enrich only missing fields — never mutate present values
+  - Original event is never mutated (enrichment produces new values)
+
+================================================================================
+SUB-TASK C7: FHIR & JSON Payload Validation
+================================================================================
+
+DESCRIPTION:
+  Implement payload validation with content type branching. FHIR R4
+  structural validation (via HAPI FHIR) for application/fhir+json,
+  JSON validity check for application/json, and rejection for all other
+  content types.
+
+DELIVERABLES:
+  1. HapiFhirConfig.java (config/ or fhir/):
+     - @Bean FhirContext fhirContext() — FhirContext.forR4() (singleton)
+     - @Bean IParser fhirJsonParser(FhirContext ctx)
+
+  2. FhirResourceParser.java (fhir/):
+     - parse(Map<String,Object> data) → IBaseResource
+     - detectResourceType(Map<String,Object> data) → String
+
+  3. FhirResourceValidator.java (fhir/):
+     - validate(Map<String,Object> data, String subject) → FhirValidationResult
+     - Checks (when datacontenttype = application/fhir+json):
+       a. data parses as valid JSON → Required (reject with INVALID_FHIR)
+       b. data.resourceType present and non-empty → Required (reject)
+       c. HAPI FHIR can parse into IBaseResource → Required (reject)
+       d. data.subject.reference matches subject field → Warning (accept, log)
+     - Returns FhirValidationResult { boolean valid, List<String> errors,
+       List<String> warnings, IBaseResource parsedResource }
+
+  4. Content type branching logic (service/ — may be standalone or in
+     EventIngestionService):
+     - application/fhir+json (or absent): full FHIR validation (above)
+     - application/json: validate data is non-empty valid JSON object;
+       reject with INVALID_JSON if invalid
+     - Any other value: reject with UNSUPPORTED_CONTENT_TYPE
+
+  5. FhirValidationException.java (api/exception/):
+     - Contains validation errors list
+
+  6. Unit tests verifying:
+     - Valid FHIR Encounter, Observation, Condition parse without errors
+     - Missing resourceType → INVALID_FHIR rejection
+     - Unparseable JSON → INVALID_FHIR rejection
+     - Subject mismatch → warning (not rejection)
+     - application/json with valid JSON → passes (no FHIR validation)
+     - application/json with invalid/empty JSON → INVALID_JSON rejection
+     - Unsupported content type → UNSUPPORTED_CONTENT_TYPE rejection
+
+ACCEPTANCE CRITERIA:
+  - FHIR validation only applied when datacontenttype = application/fhir+json
+  - Non-FHIR JSON payloads accepted with basic validity check
+  - Unsupported content types rejected immediately
+  - Three distinct rejection reasons for three failure paths
+  - FhirContext is a singleton Bean (never re-created per request)
+
+================================================================================
+SUB-TASK C8: Deduplication Service
+================================================================================
+
+DESCRIPTION:
+  Implement PostgreSQL-based deduplication with configurable lookback window.
+  Follows the idempotent POST pattern (200 on duplicates, not 409).
+  Uses single constraint on inbound_event(cloudevents_id, source).
+
+DELIVERABLES:
+  1. DeduplicationService.java (service/):
+     - isDuplicate(String cloudEventsId, String source) → boolean
+     - Implementation:
+       a. Query inbound_event table for matching (cloudevents_id, source)
+          within configurable lookback window (default 30 days)
+       b. If found: return true (caller handles status update)
+       c. If not found: return false (proceed with processing)
+     - Lookback query: WHERE cloudevents_id = :id AND source = :source
+       AND received_at >= :lookbackDate
+
+  2. Configuration in @ConfigurationProperties:
+     - cce.collector.dedup.lookback-days: 30
+
+  3. DuplicateEventException.java (api/exception/):
+     - Contains eventId, existingRecordId
+
+  4. Integration tests with Testcontainers PostgreSQL:
+     - First submission → not duplicate
+     - Second identical submission → duplicate
+     - Same ID, different source → not duplicate
+     - Event outside lookback window → depends on DB constraint
+
+ACCEPTANCE CRITERIA:
+  - Dedup check runs in < 5ms on indexed table
+  - Lookback window is configurable
+  - DB unique constraint on inbound_event serves as permanent backstop
+  - Duplicate returns 200 (not 409) with duplicate status
+
+================================================================================
+SUB-TASK C9: Kafka Producer (Synchronous)
+================================================================================
+
+DESCRIPTION:
+  Implement synchronous Kafka producer. Events are published to Kafka
+  INLINE with the HTTP request — no outbox pattern, no background retry.
+  On failure, HTTP 500 is returned and the source system retries.
+
+DELIVERABLES:
+  1. KafkaProducerConfig.java (config/):
+     - ProducerFactory<String, Object> with:
+       acks=all, retries=3, enable.idempotence=true, linger.ms=5
+     - KafkaTemplate<String, Object> bean
+     - JSON serializer (Jackson) for CloudEventMessage value
+
+  2. InboundEventProducer.java (kafka/):
+     - publish(CloudEventMessage event) → void (throws KafkaPublishException)
+     - SYNCHRONOUS send: kafkaTemplate.send(...).get()
+       (blocks until broker acknowledges or timeout)
+     - Key: subject (patient UPID) — ensures per-patient ordering
+     - Topic: cce.events.inbound (configurable via properties)
+     - On success: returns normally (caller handles HTTP 202)
+     - On failure: throws KafkaPublishException (caller handles 500 + rejection)
+
+  3. CloudEventMessage mapper:
+     - Converts InboundEvent entity → CloudEventMessage DTO
+     - All field names LOWERCASE (no camelCase translation)
+     - @JsonInclude(NON_NULL) — null fields omitted
+
+  4. KafkaPublishException.java (api/exception/)
+
+  5. Integration tests with Testcontainers Kafka:
+     - Event published → message on cce.events.inbound topic
+     - Kafka unavailable → KafkaPublishException thrown
+     - Message key = subject, value = lowercase CloudEvents JSON
+     - Null extension fields (protocolinstanceid etc.) omitted from JSON
+
+ACCEPTANCE CRITERIA:
+  - Events published to cce.events.inbound with subject as key
+  - Publish is SYNCHRONOUS (blocks until ack)
+  - No outbox table, no scheduled retry, no background processor
+  - Producer uses idempotent configuration
+  - CloudEventMessage uses lowercase field names (verified in Kafka consumer)
+
+================================================================================
+SUB-TASK C10: Event Ingestion Orchestrator & REST Endpoint
+================================================================================
+
+DESCRIPTION:
+  Implement the main event ingestion pipeline that orchestrates validation,
+  deduplication, persistence, defaults enrichment, payload validation, and
+  synchronous Kafka publishing. Expose as POST /v1/events REST endpoint.
+
+DELIVERABLES:
+  1. EventIngestionService.java (service/):
+     - ingest(EventIngestionRequest request) → EventIngestionResponse
+     - Orchestration flow (9 steps per architecture.md § 6):
+       1. Parse request body
+       2. CloudEvents envelope validation → 400 on failure
+       3. Deduplication check → 200 (idempotent) if duplicate
+       4. Persist to inbound_event (status=RECEIVED, raw_payload=original)
+       5. Event type validation (strict org.openphc.cce.<resource> match)
+          → 400 + REJECTED on failure
+       6. Apply server-side defaults (correlationid, time)
+       7. Payload validation (branched by datacontenttype):
+          - application/fhir+json → FHIR R4 validation → 422 on failure
+          - application/json → JSON validity check → 422 on failure
+          - other → 400 UNSUPPORTED_CONTENT_TYPE
+       8. Update inbound_event.status = ACCEPTED
+       9. Synchronous Kafka publish
+          - Success → HTTP 202 Accepted with receipt
+          - Failure → update status=REJECTED, reason=KAFKA_PUBLISH_FAILURE,
+            return HTTP 500
+
+  2. RejectionService.java (service/):
+     - recordRejection(InboundEvent event, RejectionReason reason,
+       FailureStage stage, String errorDetails) → void
+     - Updates inbound_event with rejection_reason, failure_stage,
+       error_details, sets status = REJECTED
+
+  3. EventIngestionController.java (api/controller/):
+     - @PostMapping("/v1/events")
+     - Accepts @Valid @RequestBody EventIngestionRequest
+     - Returns ResponseEntity<ApiResponse<EventIngestionResponse>>
+     - 202 Accepted on success, 200 on duplicate, 400/422 on validation
+       failure, 500 on Kafka failure
+
+  4. GlobalExceptionHandler.java (api/exception/):
+     - @RestControllerAdvice
+     - Handles: CloudEventValidationException → 400
+     - Handles: InvalidEventTypeException → 400
+     - Handles: FhirValidationException → 422
+     - Handles: DuplicateEventException → 200 (idempotent)
+     - Handles: KafkaPublishException → 500
+     - Handles: MethodArgumentNotValidException → 400 (bean validation)
+     - Handles: Exception → 500
+     - All responses wrapped in ApiError envelope
+
+  5. Integration tests:
+     - Happy path: valid FHIR event → 202, inbound=ACCEPTED, on Kafka
+     - Happy path: valid JSON event (application/json) → 202
+     - Invalid envelope → 400, inbound=REJECTED
+     - Invalid event type → 400, inbound=REJECTED, reason=INVALID_EVENT_TYPE
+     - Invalid FHIR → 422, inbound=REJECTED, reason=INVALID_FHIR
+     - Invalid JSON (application/json) → 422, reason=INVALID_JSON
+     - Unsupported content type → 400, reason=UNSUPPORTED_CONTENT_TYPE
+     - Duplicate → 200 with duplicate status
+     - Kafka failure → 500, inbound=REJECTED, reason=KAFKA_PUBLISH_FAILURE
+     - All responses wrapped in ApiResponse/ApiError envelope
+
+ACCEPTANCE CRITERIA:
+  - Full 9-step pipeline executes correctly
+  - Each failure case produces correct HTTP status and rejection record
+  - inbound_event status reflects pipeline outcome
+  - Transaction boundaries: inbound_event persist committed before Kafka
+  - Payload size check enforced (default 1MB)
+  - Kafka failure returns 500 (not 202) — no deferred retry
+
+================================================================================
+SUB-TASK C11: Rejected Event Management Endpoints
+================================================================================
+
+DESCRIPTION:
+  Implement REST endpoints for querying and managing rejected events.
+  Rejected events are tracked directly on inbound_event (no separate
+  dead letter table). Provide list, detail, and retry operations.
+
+DELIVERABLES:
+  1. RejectedEventController.java (api/controller/):
+     - GET /v1/events/rejected — List with pagination
+       Query params: page, size, rejectionReason, resolved
+       Response: ApiResponse<Page<RejectedEventDto>>
+       Queries inbound_event WHERE status = 'REJECTED'
+     - GET /v1/events/rejected/{id} — Single rejected event
+       Response: ApiResponse<RejectedEventDto>
+     - POST /v1/events/rejected/{id}/retry — Retry a rejected event
+       Re-submits the original raw_payload through the full validation
+       pipeline (type validation, defaults, FHIR/JSON validation, Kafka publish)
+       Response: ApiResponse<RejectedEventDto> with updated status
+
+  2. RejectedEventService.java (service/) — optional, may be in
+     EventIngestionService:
+     - listRejected(Pageable, Optional<RejectionReason>, Optional<Boolean>)
+     - getById(UUID id)
+     - retry(UUID id) → reprocesses raw_payload through pipeline
+
+  3. Integration tests:
+     - GET /v1/events/rejected returns paginated list
+     - Filter by rejectionReason works
+     - Filter by resolved works
+     - POST /v1/events/rejected/{id}/retry reprocesses event
+     - Retry of KAFKA_PUBLISH_FAILURE → republishes if Kafka is now available
+     - Retry of INVALID_FHIR → still rejected (payload hasn't changed)
+
+ACCEPTANCE CRITERIA:
+  - All queries hit inbound_event table (no separate dead letter table)
+  - Pagination works correctly
+  - Retry re-runs full pipeline on original raw_payload
+  - Retry updates status to ACCEPTED (if now valid) or keeps REJECTED
+
+================================================================================
+SUB-TASK C12: Observability — Metrics, Health & Logging
+================================================================================
+
+DESCRIPTION:
+  Add Micrometer metrics, custom health indicators, structured logging,
+  and Spring Boot Actuator configuration.
+
+DELIVERABLES:
+  1. ObservabilityConfig.java (config/):
+     - Common Micrometer tags: service=collector-service
+     - Custom metrics registration
+
+  2. Metrics instrumented at key points:
+     - cce_events_received_total (counter) — POST /v1/events called
+     - cce_events_accepted_total (counter) — Event passed all validation
+     - cce_events_rejected_total (counter, tag: reason) — Validation/publish failures
+     - cce_events_duplicated_total (counter) — Dedup hits
+     - cce_events_published_total (counter) — Kafka publish success
+     - cce_kafka_publish_seconds (timer) — Kafka publish latency
+     - cce_rejected_events_unresolved_total (gauge) — Unresolved rejected events
+     - http_server_requests_seconds (histogram) — HTTP request latency
+     NOTE: No outbox-related metrics (no outbox pattern)
+
+  3. Health indicators:
+     - PostgreSQL connection health (auto via DataSource)
+     - Kafka broker connectivity (custom health indicator / auto)
+     - Readiness: DB + Kafka both UP
+     - Liveness: application thread alive
+
+  4. Structured logging (logback-spring.xml):
+     - JSON format for production profile (Logstash encoder)
+     - MDC fields: correlationId, cloudEventsId, source, subject
+     - Log levels: service=DEBUG, framework=INFO, Kafka=WARN
+
+  5. Actuator configuration:
+     - Exposed: health, info, prometheus, metrics
+     - Health probes: liveness (/actuator/health/liveness),
+       readiness (/actuator/health/readiness)
+
+ACCEPTANCE CRITERIA:
+  - Prometheus endpoint at /actuator/prometheus returns all custom metrics
+  - Health endpoint returns component-level status
+  - Structured JSON logs include MDC fields
+  - Correlation ID propagated through all log entries for a request
+
+================================================================================
+SUB-TASK C13: Integration Tests (Full Pipeline)
+================================================================================
+
+DESCRIPTION:
+  Comprehensive integration test suite using Testcontainers to verify the
+  complete event ingestion pipeline end-to-end.
+
+DELIVERABLES:
+  1. Test infrastructure:
+     - AbstractIntegrationTest base class with:
+       @Testcontainers, @SpringBootTest
+       PostgreSQL container (16-alpine)
+       Kafka container (confluentinc/cp-kafka or apache/kafka)
+       @DynamicPropertySource for datasource + kafka
+     - Test Kafka consumer for verifying published messages
+
+  2. Happy path tests:
+     - Valid FHIR Encounter event → 202, inbound=ACCEPTED,
+       message on Kafka cce.events.inbound, LOWERCASE field names
+     - Valid Observation event → same flow
+     - Valid non-FHIR event (datacontenttype=application/json) → 202,
+       accepted, skips FHIR check
+     - Missing time → filled with server received_at
+     - Missing correlationid → generated as corr-<uuid>
+
+  3. Validation failure tests:
+     - Missing specversion → 400, inbound=REJECTED, reason=INVALID_ENVELOPE
+     - Missing subject → 400, inbound=REJECTED, reason=MISSING_SUBJECT
+     - Invalid event type (cce.encounter.created) → 400, reason=INVALID_EVENT_TYPE
+     - Invalid FHIR payload → 422, inbound=REJECTED, reason=INVALID_FHIR
+     - Invalid JSON payload (application/json) → 422, reason=INVALID_JSON
+     - Unsupported content type → 400, reason=UNSUPPORTED_CONTENT_TYPE
+     - Oversized payload → 400, reason=PAYLOAD_TOO_LARGE
+
+  4. Deduplication tests:
+     - Same (id, source) submitted twice → first 202, second 200 (duplicate)
+     - Same id, different source → both 202 (not duplicate)
+     - No duplicate Kafka message published
+
+  5. Kafka failure tests:
+     - Stop Kafka container → event persisted with ACCEPTED then updated
+       to REJECTED(KAFKA_PUBLISH_FAILURE), HTTP 500 returned
+     - Restart Kafka → new event succeeds (no background retry of old one)
+     - Verify no outbox retry — old KAFKA_PUBLISH_FAILURE stays REJECTED
+
+  6. Field verification:
+     - Consume from Kafka, assert LOWERCASE field names (not camelCase)
+     - Assert Kafka key equals subject
+     - Assert correlationid present (generated if absent)
+     - Assert type is org.openphc.cce.* pattern (not normalized from other patterns)
+     - Assert null fields (protocolinstanceid etc.) are OMITTED from JSON
+
+  7. Rejected event management tests:
+     - GET /v1/events/rejected returns paginated list
+     - POST /v1/events/rejected/{id}/retry re-processes event
+     - Filter by rejectionReason returns correct subset
+
+ACCEPTANCE CRITERIA:
+  - All tests pass with `mvn verify`
+  - Full pipeline verified end-to-end with real PostgreSQL + Kafka
+  - Test execution < 2 minutes (container reuse)
+  - No mocked infrastructure — real containers only
+  - Tests verify NO camelCase field names in Kafka messages
+  - Tests verify NO outbox retry behaviour
+
+================================================================================
+SUB-TASK C14: Configuration Tuning & Documentation
+================================================================================
+
+DESCRIPTION:
+  Final configuration review, application-docker.yml for container deployment,
+  and comprehensive README with build/run instructions.
+
+DELIVERABLES:
+  1. application-docker.yml:
+     - Environment-variable-driven config for containerized deployment
+     - ${DB_HOST:localhost}, ${DB_PORT:5432}, ${DB_NAME:cce_collector}
+     - ${KAFKA_BOOTSTRAP:localhost:9092}
+     - ${CCE_DEDUP_LOOKBACK_DAYS:30}
+
+  2. README.md with:
+     - Service overview and responsibilities
+     - Prerequisites (Java 21, Docker, Maven 3.9+)
+     - Build: mvn clean package -DskipTests
+     - Run: docker-compose up, or mvn spring-boot:run
+     - API documentation (POST /v1/events example with curl)
+     - Rejected event management examples
+     - Configuration reference table
+     - Monitoring: Prometheus endpoint, key metrics
+     - Architecture decisions:
+       • Single-table design (inbound_event only)
+       • Synchronous Kafka publish (no outbox, 500 on failure)
+       • Event type validation (not normalization)
+       • Lowercase field names end-to-end
+
+  3. Review and harden:
+     - Verify all application.yml properties are documented
+     - Verify Flyway migration matches entity definition
+     - Verify Kafka topic names are consistent and configurable
+     - Verify error codes match api-reference.md
+     - Verify no stale references to event_log, dead_letter_event,
+       outbox, camelCase, or normalization
+
+ACCEPTANCE CRITERIA:
+  - docker-compose up starts the full stack from scratch
+  - curl examples in README work against running service
+  - All configuration properties documented
+
+================================================================================
+TASK DEPENDENCY GRAPH
+================================================================================
+
+  C0 (Service Design Docs — PR Review)
+  └── C1 (Scaffolding)  [blocked until C0 approved]
+      └── C2 (Flyway Migration — single table)
+          └── C3 (Entity, Enums & Repository)
+              └── C4 (DTOs & Response Envelopes)
+                  ├── C5 (CloudEvents Envelope Validation)
+                  ├── C6 (Event Type Validation & Defaults Enrichment)
+                  ├── C7 (FHIR & JSON Payload Validation)
+                  └── C8 (Deduplication Service)
+                      └── C9 (Kafka Producer — Synchronous)
+                          └── C10 (Ingestion Orchestrator & REST Endpoint)
+                              ├── C11 (Rejected Event Management)
+                              └── C12 (Observability)
+                                  └── C13 (Integration Tests — Full Pipeline)
+                                      └── C14 (Config Tuning & Documentation)
+
+  NOTE: C5, C6, C7, C8 can all be developed in PARALLEL after C4 is complete.
+        C9 depends on C4 (for CloudEventMessage DTO).
+        C10 depends on C5–C9 (orchestrates all components).
+        C11 and C12 can be developed in PARALLEL after C10.
+        Implementation (C1–C14) begins only after C0 is approved.
+
+================================================================================
+ESTIMATED EFFORT
+================================================================================
+
+  C0:  2 hours   (Design docs — already completed, PR for review)
+  C1:  4 hours   (Scaffolding)
+  C2:  1 hour    (Single Flyway migration — simplified from 3 to 1)
+  C3:  2 hours   (Single entity + enums + repo — simplified from 3 entities)
+  C4:  3 hours   (DTOs & envelopes)
+  C5:  2 hours   (CloudEvents validation)
+  C6:  2 hours   (Event type validation + defaults — simpler than normalization)
+  C7:  3 hours   (FHIR + JSON validation with content type branching)
+  C8:  2 hours   (Deduplication)
+  C9:  2 hours   (Kafka producer — simplified, no outbox)
+  C10: 5 hours   (Ingestion orchestrator — main integration point)
+  C11: 3 hours   (Rejected event endpoints — simpler than dead letter service)
+  C12: 3 hours   (Observability)
+  C13: 5 hours   (Integration tests)
+  C14: 2 hours   (Config & docs)
+
+  TOTAL: ~41 hours (~5.5 working days)
+
+  Savings vs. original estimate: ~11 hours saved by:
+  - Single table (no event_log, no dead_letter_event migrations/entities)
+  - No outbox pattern (no OutboxRetryScheduler, no EventPublisher)
+  - No event normalization (strict validation is simpler)
+  - No field name mapping (lowercase end-to-end)
+
+================================================================================
+KEY DIFFERENCES FROM ORIGINAL SUB-TASKS
+================================================================================
+
+  REMOVED:
+  - event_log table + V2 migration + EventLog entity + EventLogRepository
+  - dead_letter_event table + V3 migration + DeadLetterEvent entity +
+    DeadLetterEventRepository
+  - PublishStatus enum (PENDING, PUBLISHED, FAILED)
+  - EventPublisher.java (outbox publish orchestrator)
+  - OutboxRetryScheduler.java (@Scheduled retry mechanism)
+  - EventNormalizer.java (type normalization: cce.encounter.created → ...)
+  - DeadLetterService.java + DeadLetterController.java + DeadLetterDto.java
+  - DeadLetterProducer.java (cce.deadletter Kafka publisher)
+  - Field name mapping logic (HTTP lowercase → Kafka camelCase)
+  - Partition management (event_log monthly partitions)
+  - Outbox-related config (retry-interval-ms, retry-batch-size)
+  - Outbox-related metrics (cce_outbox_pending_total, retry counts)
+
+  ADDED:
+  - EventTypeValidator.java (strict pattern validation, not normalization)
+  - EventDefaultsEnricher.java (correlationid + time fill)
+  - RejectionService.java (updates inbound_event with rejection details)
+  - RejectedEventController.java (replaces DeadLetterController)
+  - FailureStage enum (VALIDATION, PROCESSING, KAFKA_PUBLISH)
+  - Content type branching (application/fhir+json, application/json, reject)
+  - Rejection tracking columns on inbound_event (rejection_reason,
+    failure_stage, error_details, resolved, resolved_at)
+  - INVALID_EVENT_TYPE rejection reason
+  - INVALID_JSON rejection reason
+  - UNSUPPORTED_CONTENT_TYPE rejection reason
+
+  CHANGED:
+  - C2: 3 migrations → 1 migration
+  - C3: 3 entities → 1 entity; 3 repos → 1 repo; 4 enums → 3 enums
+  - C4: CloudEventMessage uses lowercase (not camelCase)
+  - C6: Normalization → Event type validation + defaults enrichment
+  - C8: Simplified dedup (single table constraint, no secondary index)
+  - C9: Synchronous Kafka producer (no outbox) → replaces C10 Outbox
+  - C10: Orchestrator updated for 9-step flow (was 10), includes
+         RejectionService
+  - C11: Rejected event endpoints (replaces dead letter CRUD)
+  - Dependency graph: flatter (C5-C8 in parallel, no outbox dependency)
+  - Effort: ~41 hours (down from ~52 hours)
+
+================================================================================

@@ -4,15 +4,18 @@ import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
+import org.openphc.cce.collector.domain.model.enums.FailureStage;
 import org.openphc.cce.collector.domain.model.enums.InboundStatus;
+import org.openphc.cce.collector.domain.model.enums.RejectionReason;
 
 import java.time.OffsetDateTime;
 import java.util.Map;
 import java.util.UUID;
 
 /**
- * Raw inbound request log — every received event is persisted as-is before processing.
- * Used for audit trail and primary deduplication.
+ * Single table design — audit trail, dedup source, rejection tracking, and Kafka source.
+ * Every HTTP request is persisted as-is before processing. Rejected events are recorded
+ * directly on this table — there is no separate dead letter table.
  */
 @Entity
 @Table(name = "inbound_event")
@@ -67,8 +70,23 @@ public class InboundEvent {
     @Builder.Default
     private InboundStatus status = InboundStatus.RECEIVED;
 
+    @Enumerated(EnumType.STRING)
     @Column(name = "rejection_reason")
-    private String rejectionReason;
+    private RejectionReason rejectionReason;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "failure_stage")
+    private FailureStage failureStage;
+
+    @Column(name = "error_details", columnDefinition = "TEXT")
+    private String errorDetails;
+
+    @Column(nullable = false)
+    @Builder.Default
+    private boolean resolved = false;
+
+    @Column(name = "resolved_at")
+    private OffsetDateTime resolvedAt;
 
     @Column(name = "received_at", nullable = false)
     @Builder.Default

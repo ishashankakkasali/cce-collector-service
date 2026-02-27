@@ -17,9 +17,6 @@ cce:
     fhir-validation:
       enabled: true
       strict-mode: false
-    outbox:
-      retry-interval-seconds: 15
-      retry-max-age-minutes: 120
 
 logging:
   level:

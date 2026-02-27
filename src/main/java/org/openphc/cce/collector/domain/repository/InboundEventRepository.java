@@ -2,6 +2,9 @@ package org.openphc.cce.collector.domain.repository;
 
 import org.openphc.cce.collector.domain.model.InboundEvent;
 import org.openphc.cce.collector.domain.model.enums.InboundStatus;
+import org.openphc.cce.collector.domain.model.enums.RejectionReason;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
@@ -19,4 +22,14 @@ public interface InboundEventRepository extends JpaRepository<InboundEvent, UUID
     boolean existsByCloudeventsIdAndSourceAndReceivedAtAfter(String cloudeventsId, String source, OffsetDateTime since);
 
     long countByStatus(InboundStatus status);
+
+    long countByStatusAndResolved(InboundStatus status, boolean resolved);
+
+    Page<InboundEvent> findByStatusAndResolvedFalse(InboundStatus status, Pageable pageable);
+
+    Page<InboundEvent> findByStatusAndRejectionReason(InboundStatus status, RejectionReason reason, Pageable pageable);
+
+    Page<InboundEvent> findByStatusAndSource(InboundStatus status, String source, Pageable pageable);
+
+    Page<InboundEvent> findByStatusAndResolved(InboundStatus status, boolean resolved, Pageable pageable);
 }

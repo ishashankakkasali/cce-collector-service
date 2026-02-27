@@ -9,7 +9,8 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for CloudEventValidator.
+ * Unit tests for CloudEventValidator — validates CloudEvents v1.0 envelope.
+ * Validates that all errors are aggregated (not thrown on first failure).
  */
 class CloudEventValidatorTest {
 
@@ -42,7 +43,7 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("specversion", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("specversion")));
     }
 
     @Test
@@ -59,7 +60,7 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("specversion", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("specversion")));
     }
 
     @Test
@@ -75,7 +76,7 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("id", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'id'")));
     }
 
     @Test
@@ -91,7 +92,7 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("source", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'source'")));
     }
 
     @Test
@@ -107,7 +108,7 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("type", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'type'")));
     }
 
     @Test
@@ -123,7 +124,7 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("subject", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'subject'")));
     }
 
     @Test
@@ -139,7 +140,7 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("data", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'data'")));
     }
 
     @Test
@@ -157,6 +158,26 @@ class CloudEventValidatorTest {
         CloudEventValidationException ex = assertThrows(
                 CloudEventValidationException.class,
                 () -> validator.validate(request));
-        assertEquals("id", ex.getField());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("max length")));
+    }
+
+    @Test
+    void shouldAggregateAllErrors() {
+        // Request missing specversion, id, source, type, subject, and data — all errors should be reported
+        EventIngestionRequest request = EventIngestionRequest.builder().build();
+
+        CloudEventValidationException ex = assertThrows(
+                CloudEventValidationException.class,
+                () -> validator.validate(request));
+
+        // Should have at least 6 errors (one for each required field)
+        assertTrue(ex.getErrors().size() >= 6,
+                "Expected at least 6 errors but got " + ex.getErrors().size() + ": " + ex.getErrors());
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'specversion'")));
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'id'")));
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'source'")));
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'type'")));
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'subject'")));
+        assertTrue(ex.getErrors().stream().anyMatch(e -> e.contains("'data'")));
     }
 }
