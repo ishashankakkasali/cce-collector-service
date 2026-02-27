@@ -1,36 +1,102 @@
 version: '3.8'
 
+# Shared infrastructure: PostgreSQL and Kafka are on the 'cce-network' so the
+# compliance-service (in its own compose file) can attach to the same network
+# and reach them by container name.
+
 services:
-  cce-collector-postgres:
+
+  # ──────────────────────────────────────────────
+  # Shared PostgreSQL — hosts databases for both
+  # collector (cce_collector) and compliance (cce)
+  # ──────────────────────────────────────────────
+  cce-postgres:
     image: postgres:16-alpine
+    container_name: cce-postgres
     environment:
-      POSTGRES_DB: cce_collector
-      POSTGRES_USER: cce_collector
-      POSTGRES_PASSWORD: cce_collector
+      POSTGRES_USER: cce_admin
+      POSTGRES_PASSWORD: cce_admin
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
-      - collector-pgdata:/var/lib/postgresql/data
+      - cce-pgdata:/var/lib/postgresql/data
+      - ./infra/init-databases.sql:/docker-entrypoint-initdb.d/01-init-databases.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cce_collector"]
+      test: ["CMD-SHELL", "pg_isready -U cce_admin"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - cce-network
 
+  # ──────────────────────────────────────────────
+  # Shared Kafka (KRaft single-broker, dev mode)
+  # ──────────────────────────────────────────────
   cce-kafka:
     image: apache/kafka:3.7.0
+    container_name: cce-kafka
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://cce-kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@cce-kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
     ports:
-      - "9092:9092"
+      - "9094:9094"   # external access from host
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cce-network
+
+  # ──────────────────────────────────────────────
+  # CCE Collector Service — exposed on host:8081
+  # ──────────────────────────────────────────────
+  cce-collector-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cce-collector-service
+    ports:
+      - "8081:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      DB_HOST: cce-postgres
+      DB_PORT: 5432
+      DB_NAME: cce_collector
+      DB_USER: cce_collector
+      DB_PASSWORD: cce_collector
+      KAFKA_BROKERS: cce-kafka:9092
+    depends_on:
+      cce-postgres:
+        condition: service_healthy
+      cce-kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cce-network
+
+# ──────────────────────────────────────────────
+# Shared network — compliance-service can join
+# with:  networks: cce-network: external: true
+# ──────────────────────────────────────────────
+networks:
+  cce-network:
+    name: cce-network
+    driver: bridge
 
 volumes:
-  collector-pgdata:
+  cce-pgdata:

@@ -2,7 +2,7 @@ spring:
   application:
     name: cce-collector-service
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5433}/${DB_NAME:cce_collector}
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:cce_collector}
     username: ${DB_USER:cce_collector}
     password: ${DB_PASSWORD:cce_collector}
     hikari:
