@@ -226,6 +226,7 @@ flowchart LR
         A3["correlationid: null"]
         A4["time: null"]
         A5["facilityid: '0002'"]
+        A6["facilityname: 'Kicukiro Health Center'"]
     end
 
     subgraph Defaults["EventDefaultsEnricher"]
@@ -240,6 +241,7 @@ flowchart LR
         B3["correlationid: 'corr-abc-123'"]
         B4["time: '2026-02-25T08:00:00Z'"]
         B5["facilityid: '0002'"]
+        B6["facilityname: 'Kicukiro Health Center'"]
     end
 
     A1 --> B1
@@ -247,6 +249,7 @@ flowchart LR
     A3 --> N2 --> B3
     A4 --> N3 --> B4
     A5 --> B5
+    A6 --> B6
 
     style Validate fill:#5cb85c,color:#fff
     style Defaults fill:#4a90d9,color:#fff

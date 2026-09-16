@@ -67,6 +67,7 @@ public class EventIngestionRequest {
     // ─── CCE extension attributes (lowercase per CloudEvents spec) ─
 
     private String facilityid;
+    private String facilityname;
     private String correlationid;
     private String sourceeventid;
     private String protocolinstanceid;
