@@ -103,6 +103,7 @@ The Kafka message value is a CloudEvents JSON object. Field names use **lowercas
   "protocoldefinitionid": null,
   "actionid": null,
   "facilityid": "0002",
+  "facilityname": "Kicukiro Health Center",
   "data": {
     "resourceType": "Encounter",
     "id": "enc-uuid-visit-kicukiro-001",
@@ -129,6 +130,7 @@ The Kafka message value is a CloudEvents JSON object. Field names use **lowercas
 | `protocoldefinitionid` | `String` | No | Protocol definition UUID (usually null — Compliance Service resolves) |
 | `actionid` | `String` | No | Action/step ID (usually null — Compliance Service resolves) |
 | `facilityid` | `String` | No | Healthcare facility FOSA ID |
+| `facilityname` | `String` | No | Healthcare facility display name — pass-through only, never derived from `data` |
 | `data` | `Object` | Yes | FHIR R4 resource JSON or valid JSON object (structurally validated) |
 
 > **Note:** `null` fields are omitted from the JSON output (`@JsonInclude(NON_NULL)`).
@@ -217,6 +219,7 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
   "sourceeventid": "enc-visit-20260225-0001",
   "facilityid": "0002",
+  "facilityname": "Kicukiro Health Center",
   "data": {
     "resourceType": "Encounter",
     "id": "enc-uuid-visit-kicukiro-001",
@@ -265,6 +268,7 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
   "sourceeventid": "obs-bp-20260225-0001",
   "facilityid": "0002",
+  "facilityname": "Kicukiro Health Center",
   "data": {
     "resourceType": "Observation",
     "id": "obs-uuid-bp-001",
@@ -328,6 +332,7 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
   "sourceeventid": "cond-diag-20260225-0001",
   "facilityid": "0002",
+  "facilityname": "Kicukiro Health Center",
   "data": {
     "resourceType": "Condition",
     "id": "cond-uuid-malaria-001",
@@ -371,6 +376,7 @@ The Compliance Service consumes from `cce.events.inbound` with these guarantees 
   "correlationid": "corr-1343872c-636d-506f-b041-1e571d426932",
   "sourceeventid": "rx-act-20260225-0001",
   "facilityid": "0002",
+  "facilityname": "Kicukiro Health Center",
   "data": {
     "resourceType": "MedicationRequest",
     "id": "rx-uuid-act-001",

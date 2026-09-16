@@ -32,12 +32,13 @@ Ingest a single CloudEvents-formatted clinical event.
 | `data` | `object` | Yes | Event payload (FHIR R4 resource) |
 | `correlationid` | `string` | No | Trace correlation ID (generated if absent) |
 | `facilityid` | `string` | No | Facility identifier |
+| `facilityname` | `string` | No | Facility display name (pass-through only — never derived from `data`) |
 | `sourceeventid` | `string` | No | Source-system internal event identifier |
 | `protocolinstanceid` | `string` | No | Protocol instance reference (set by Compliance Service) |
 | `protocoldefinitionid` | `string` | No | Protocol definition reference (set by Compliance Service) |
 | `actionid` | `string` | No | Action/step reference (set by Compliance Service) |
 
-> **Note:** Field names use **lowercase** as per CloudEvents HTTP binding specification. Any fields not in the above list are captured via `@JsonAnySetter` as extension attributes.
+> **Note:** Field names use **lowercase** as per CloudEvents HTTP binding specification. `EventIngestionRequest` is annotated `@JsonIgnoreProperties(ignoreUnknown = true)` — any field not in the list above is **silently discarded** on ingestion, not captured as a generic extension attribute. A new CloudEvents extension (as `facilityname` was until this field was added) must be added to this DTO explicitly, or it never reaches `raw_payload`, Kafka, or anything downstream.
 
 #### Example Request
 
@@ -51,6 +52,7 @@ Ingest a single CloudEvents-formatted clinical event.
   "time": "2025-01-15T09:30:00Z",
   "datacontenttype": "application/fhir+json",
   "facilityid": "facility/FAC-KGL-S-001",
+  "facilityname": "Kigali South Health Facility",
   "correlationid": "corr-abc123-def456",
   "data": {
     "resourceType": "Encounter",

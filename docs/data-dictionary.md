@@ -97,6 +97,7 @@ Inbound requests use **lowercase** field names per the CloudEvents v1.0 specific
 |-------|------|-------------------|---------|
 | `time` | `string` | Server `received_at` | `"2026-02-25T08:00:00Z"` |
 | `facilityid` | `string` | — | `"0002"` |
+| `facilityname` | `string` | — | `"Kamiriithu Health Centre"` |
 | `correlationid` | `string` | Generated `corr-<uuid>` | `"corr-1343872c-636d-506f-b041-1e571d426932"` |
 
 ### 3.3 Optional Extension Fields
@@ -129,6 +130,7 @@ Published to `cce.events.inbound` using **CloudEvents spec field names (lowercas
 | `protocoldefinitionid` | `String` | Yes | (usually null — Compliance Service resolves) |
 | `actionid` | `String` | Yes | (usually null — Compliance Service resolves) |
 | `facilityid` | `String` | Yes | Request `facilityid` |
+| `facilityname` | `String` | Yes | Request `facilityname` |
 | `data` | `JsonNode` | No | Request `data` (FHIR R4 resource or JSON object) |
 
 ---
@@ -150,6 +152,7 @@ The Collector preserves CloudEvents lowercase field names end-to-end (HTTP → K
 | `datacontenttype` | — | No (in `raw_payload`) |
 | `data` | — | No (in `raw_payload`) |
 | `facilityid` | — | No (in `raw_payload`) |
+| `facilityname` | — | No (in `raw_payload`) |
 | `sourceeventid` | — | No (in `raw_payload`) |
 | `protocolinstanceid` | — | No (in `raw_payload`) |
 | `protocoldefinitionid` | — | No (in `raw_payload`) |

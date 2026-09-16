@@ -2,6 +2,24 @@
 
 ---
 
+## Unreleased — `facilityname` CloudEvents extension attribute
+
+**Branch:** `release-1.0.0`
+
+### Summary
+
+Added `facilityname` to `EventIngestionRequest` alongside the existing `facilityid` — the facility's display name, pass-through only, never derived from `data`. Before this change, any emitter adaptor sending `facilityname` (e.g. tibERbu, once it started resolving facility display names from the FHIR body) had the field **silently discarded**: `EventIngestionRequest` is `@JsonIgnoreProperties(ignoreUnknown = true)`, and `EventIngestionService.buildInboundEvent()` persists `raw_payload` by re-serializing the deserialized DTO (`objectMapper.valueToTree(request)`), not the original request bytes — so an unrecognized field never reached `raw_payload`, Kafka, or anything downstream, with no error or warning anywhere in the pipeline.
+
+- **`EventIngestionRequest.facilityname`** — new optional `String` field, same treatment as `facilityid` (nullable, omitted from JSON when absent, no validation).
+- No entity/database column added — `facilityname` only needs to survive inside `raw_payload`'s serialized JSON for downstream consumers (e.g. ClickHouse `JSONExtractString(raw_payload, 'facilityname')` at query time) to read it.
+- Also fixed an unrelated, pre-existing `Dockerfile` bug found while rebuilding locally: `COPY --from=builder /app/build/libs/cce-collector-service-*.jar app.jar` matched **two** files (the executable jar and Spring Boot's `-plain.jar`), which `docker build` refuses when copying to a single destination. Narrowed the glob to `cce-collector-service-*-SNAPSHOT.jar`.
+
+### Migration
+
+None — no schema change, no `EventIngestionRequest` field is required, and Kafka consumers using `@JsonIgnoreProperties(ignoreUnknown = true)` themselves are unaffected either way.
+
+---
+
 ## Unreleased — Clinical Event Time (`event_time`)
 
 **Branch:** `release-1.0.0`
